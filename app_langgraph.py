@@ -1,5 +1,5 @@
 """
-스마트한 쇼핑 앱 - LangGraph 버전
+스마트한 쇼핑 앱 - LangGraph 버전 (벡터 검색 포함)
 """
 
 import streamlit as st
@@ -16,9 +16,10 @@ import requests
 from bs4 import BeautifulSoup
 import numpy as np
 
-# LangGraph 관련 임포트
+# LangGraph 관련
 from typing import TypedDict, Annotated, List, Union, Dict
 from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage
 import operator
 
 # 페이지 설정
@@ -37,6 +38,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID") or st.secrets.get("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET") or st.secrets.get("NAVER_CLIENT_SECRET", "")
+
+# LangSmith 설정 (선택적)
+LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
+if LANGSMITH_API_KEY:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_PROJECT"] = "smart-shopping-app"
+    os.environ["LANGCHAIN_API_KEY"] = LANGSMITH_API_KEY
+else:
+    os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
 # CSS 스타일
 st.markdown("""
@@ -91,36 +101,25 @@ class SearchState(TypedDict):
     """검색 프로세스의 상태"""
     product_name: str
     search_method: str  # "database", "web_crawling", "similarity"
-    results: Dict
+    results: dict
     pros: List[str]
     cons: List[str]
-    sources: List[Dict]
-    messages: Annotated[List[str], operator.add]  # 프로세스 로그
+    sources: List[dict]
+    messages: Annotated[List[Union[HumanMessage, AIMessage]], operator.add]
     error: str
-    db_search_complete: bool
-    web_search_complete: bool
-    save_complete: bool
+    similar_product: str  # 유사도 검색으로 찾은 제품명
 
 # ========================
-# 헬퍼 클래스들
-# ========================
-
-# 클라이언트 초기화
-@st.cache_resource
-def get_openai_client():
-    return OpenAI(api_key=OPENAI_API_KEY)
-
-@st.cache_resource
-def get_supabase_client():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 # OpenAI 임베딩 클래스
+# ========================
+
 class OpenAIEmbeddings:
     def __init__(self):
-        self.client = get_openai_client()
+        self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.model = "text-embedding-ada-002"
     
     def get_embedding(self, text: str):
+        """텍스트의 임베딩 벡터 생성"""
         try:
             response = self.client.embeddings.create(
                 input=text,
@@ -132,6 +131,7 @@ class OpenAIEmbeddings:
             return None
     
     def cosine_similarity(self, vec1, vec2):
+        """코사인 유사도 계산"""
         vec1 = np.array(vec1)
         vec2 = np.array(vec2)
         
@@ -144,24 +144,41 @@ class OpenAIEmbeddings:
         
         return dot_product / (norm1 * norm2)
 
-# 크롤러 클래스
-class NaverBlogCrawler:
-    def __init__(self):
-        self.headers = {
-            "X-Naver-Client-Id": NAVER_CLIENT_ID,
-            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+# ========================
+# 크롤링 클래스
+# ========================
+
+class ProConsLaptopCrawler:
+    def __init__(self, naver_client_id, naver_client_secret):
+        self.naver_headers = {
+            "X-Naver-Client-Id": naver_client_id,
+            "X-Naver-Client-Secret": naver_client_secret
         }
+        self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    
+    def remove_html_tags(self, text):
+        text = BeautifulSoup(text, "html.parser").get_text()
+        text = re.sub(r'<[^>]+>', '', text)
+        return text.strip()
     
     def search_blog(self, query, display=10):
         url = "https://openapi.naver.com/v1/search/blog"
-        params = {"query": query, "display": display, "sort": "sim"}
+        params = {
+            "query": query,
+            "display": display,
+            "sort": "sim"
+        }
         
         try:
-            response = requests.get(url, headers=self.headers, params=params)
+            response = requests.get(url, headers=self.naver_headers, params=params)
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                for item in result.get('items', []):
+                    item['title'] = self.remove_html_tags(item['title'])
+                    item['description'] = self.remove_html_tags(item['description'])
+                return result
         except Exception as e:
-            st.error(f"블로그 검색 오류: {e}")
+            return None
         return None
     
     def crawl_content(self, url):
@@ -180,53 +197,143 @@ class NaverBlogCrawler:
                     if response.status_code == 200:
                         soup = BeautifulSoup(response.content, 'html.parser')
                         
+                        content = ""
                         for selector in ['div.se-main-container', 'div#postViewArea', 'div.post_ct']:
                             elem = soup.select_one(selector)
                             if elem:
                                 content = elem.get_text(separator='\n', strip=True)
-                                content = re.sub(r'\s+', ' ', content)
-                                return content if len(content) > 300 else None
+                                break
+                        
+                        if not content:
+                            content = soup.get_text(separator='\n', strip=True)
+                        
+                        content = re.sub(r'\s+', ' ', content)
+                        content = content.replace('\u200b', '')
+                        
+                        return content if len(content) > 300 else None
         except:
             pass
         return None
+    
+    def extract_pros_cons_with_gpt(self, product_name, content):
+        if not content or len(content) < 200:
+            return None
+        
+        content_preview = content[:1500]
+        
+        prompt = f"""다음은 "{product_name}"에 대한 블로그 리뷰입니다.
+
+[블로그 내용]
+{content_preview}
+
+위 내용에서 {product_name}의 장점과 단점을 추출해주세요.
+
+장점:
+- (구체적인 장점)
+
+단점:
+- (구체적인 단점)
+
+정보가 부족하면 "정보 부족"이라고 답하세요."""
+        
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "제품 리뷰 분석 전문가입니다."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+            
+            result = response.choices[0].message.content.strip()
+            
+            if result and "정보 부족" not in result:
+                pros = []
+                cons = []
+                
+                lines = result.split('\n')
+                current_section = None
+                
+                for line in lines:
+                    line = line.strip()
+                    if '장점:' in line:
+                        current_section = 'pros'
+                    elif '단점:' in line:
+                        current_section = 'cons'
+                    elif line.startswith('-') and current_section:
+                        point = line[1:].strip()
+                        if point and len(point) > 5:
+                            if current_section == 'pros':
+                                pros.append(point)
+                            else:
+                                cons.append(point)
+                
+                if pros or cons:
+                    return {'pros': pros[:5], 'cons': cons[:5]}
+            
+            return None
+        except:
+            return None
 
 # ========================
 # LangGraph 노드 함수들
 # ========================
 
-def search_database_node(state: SearchState) -> SearchState:
-    """데이터베이스 검색 노드"""
+# 클라이언트 초기화
+@st.cache_resource
+def get_supabase_client():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+@st.cache_resource
+def get_crawler():
+    return ProConsLaptopCrawler(NAVER_CLIENT_ID, NAVER_CLIENT_SECRET)
+
+@st.cache_resource
+def get_embeddings_helper():
+    return OpenAIEmbeddings()
+
+def search_database(state: SearchState) -> SearchState:
+    """데이터베이스에서 제품 검색 (벡터 검색 포함)"""
     product_name = state["product_name"]
-    state["messages"].append(f"📊 데이터베이스에서 '{product_name}' 검색 중...")
-    
     supabase = get_supabase_client()
-    embeddings_helper = OpenAIEmbeddings()
+    embeddings_helper = get_embeddings_helper()
+    
+    state["messages"].append(
+        HumanMessage(content=f"📊 데이터베이스에서 '{product_name}' 검색 중...")
+    )
     
     try:
         # 1. 정확한 매칭
-        result = supabase.table('laptop_pros_cons').select("*").eq('product_name', product_name).execute()
-        if result.data:
+        exact_match = supabase.table('laptop_pros_cons').select("*").eq('product_name', product_name).execute()
+        if exact_match.data:
             state["search_method"] = "database"
-            state["results"] = {"data": result.data}
-            state["messages"].append(f"✅ 데이터베이스에서 정확히 일치하는 제품 발견!")
-            state["db_search_complete"] = True
+            state["results"] = {"data": exact_match.data}
+            state["messages"].append(
+                AIMessage(content=f"✅ 데이터베이스에서 정확히 일치하는 제품 발견! ({len(exact_match.data)}개 항목)")
+            )
             return state
         
         # 2. 부분 매칭
-        result = supabase.table('laptop_pros_cons').select("*").ilike('product_name', f'%{product_name}%').execute()
-        if result.data:
+        partial_match = supabase.table('laptop_pros_cons').select("*").ilike('product_name', f'%{product_name}%').execute()
+        if partial_match.data:
             state["search_method"] = "database"
-            state["results"] = {"data": result.data}
-            state["messages"].append(f"📌 데이터베이스에서 유사한 제품 발견!")
-            state["db_search_complete"] = True
+            state["results"] = {"data": partial_match.data}
+            state["messages"].append(
+                AIMessage(content=f"📌 데이터베이스에서 유사한 제품 발견! ({len(partial_match.data)}개 항목)")
+            )
             return state
         
-        # 3. 유사도 검색
-        state["messages"].append(f"🤖 AI 유사도 검색 시도 중...")
-        query_embedding = embeddings_helper.get_embedding(product_name)
+        # 3. 벡터 유사도 검색
+        state["messages"].append(
+            AIMessage(content=f"🤖 AI 유사도 검색 시도 중...")
+        )
         
+        query_embedding = embeddings_helper.get_embedding(product_name)
         if query_embedding:
             all_products = supabase.table('laptop_pros_cons').select("*").execute()
+            
             similar_products = []
             checked_products = set()
             
@@ -239,7 +346,7 @@ def search_database_node(state: SearchState) -> SearchState:
                         item_embedding = json.loads(item['embedding']) if isinstance(item['embedding'], str) else item['embedding']
                         similarity = embeddings_helper.cosine_similarity(query_embedding, item_embedding)
                         
-                        if similarity >= 0.7:
+                        if similarity >= 0.8:  # 임계값을 0.8로 높임
                             similar_products.append({
                                 'product_name': item['product_name'],
                                 'similarity': similarity
@@ -251,120 +358,90 @@ def search_database_node(state: SearchState) -> SearchState:
             if similar_products:
                 similar_products.sort(key=lambda x: x['similarity'], reverse=True)
                 best_match = similar_products[0]['product_name']
-                result = supabase.table('laptop_pros_cons').select("*").eq('product_name', best_match).execute()
-                if result.data:
-                    state["search_method"] = "similarity"
-                    state["results"] = {"data": result.data}
-                    state["messages"].append(f"🎯 AI가 유사한 제품 '{best_match}'를 찾았습니다!")
-                    state["db_search_complete"] = True
-                    return state
+                best_similarity = similar_products[0]['similarity']
+                
+                # 실제로 유사한 제품인지 확인 (유사도가 0.8 이상이면서 검색어가 포함된 경우)
+                if best_similarity >= 0.8:
+                    result = supabase.table('laptop_pros_cons').select("*").eq('product_name', best_match).execute()
+                    if result.data:
+                        state["search_method"] = "similarity"
+                        state["results"] = {"data": result.data}
+                        state["similar_product"] = best_match
+                        state["messages"].append(
+                            AIMessage(content=f"🎯 AI가 유사한 제품 '{best_match}'를 찾았습니다! (유사도: {best_similarity:.2f})")
+                        )
+                        return state
         
-        state["messages"].append(f"❌ 데이터베이스에서 제품을 찾을 수 없음")
+        state["messages"].append(
+            AIMessage(content="❌ 데이터베이스에서 제품을 찾을 수 없음. 웹 검색을 시작합니다...")
+        )
         state["results"] = {"data": None}
-        state["db_search_complete"] = True
+        return state
         
     except Exception as e:
         state["error"] = str(e)
-        state["messages"].append(f"⚠️ 데이터베이스 검색 오류: {str(e)}")
-        state["db_search_complete"] = True
-    
-    return state
+        state["messages"].append(
+            AIMessage(content=f"⚠️ 데이터베이스 검색 오류: {str(e)}")
+        )
+        state["results"] = {"data": None}
+        return state
 
-def crawl_web_node(state: SearchState) -> SearchState:
-    """웹 크롤링 노드"""
+def crawl_web(state: SearchState) -> SearchState:
+    """웹에서 제품 정보 크롤링"""
     if state["results"].get("data"):  # 이미 DB에서 찾은 경우
         return state
     
     product_name = state["product_name"]
     state["search_method"] = "web_crawling"
-    state["messages"].append(f"🌐 웹에서 '{product_name}' 리뷰 수집 시작...")
+    crawler = get_crawler()
     
-    crawler = NaverBlogCrawler()
-    openai_client = get_openai_client()
+    state["messages"].append(
+        HumanMessage(content=f"🌐 웹에서 '{product_name}' 리뷰 수집 시작...")
+    )
     
     all_pros = []
     all_cons = []
     sources = []
     
+    # 검색 쿼리
     search_queries = [
         f"{product_name} 장단점 실사용",
         f"{product_name} 후기"
     ]
     
     for query in search_queries[:2]:
-        state["messages"].append(f"🔍 검색어: '{query}'")
-        blog_result = crawler.search_blog(query, display=5)
+        state["messages"].append(
+            AIMessage(content=f"🔍 검색어: '{query}'로 네이버 블로그 검색 중...")
+        )
         
-        if not blog_result or 'items' not in blog_result:
+        result = crawler.search_blog(query, display=5)
+        if not result or 'items' not in result:
             continue
         
-        for post in blog_result['items'][:3]:
-            title = BeautifulSoup(post['title'], "html.parser").get_text()
-            state["messages"].append(f"📖 분석 중: {title[:30]}...")
+        posts = result['items']
+        
+        for idx, post in enumerate(posts[:3]):
+            state["messages"].append(
+                AIMessage(content=f"📖 블로그 분석 중: {post['title'][:30]}...")
+            )
             
             content = crawler.crawl_content(post['link'])
+            if not content:
+                continue
             
-            if content:
-                # GPT로 장단점 추출
-                prompt = f"""다음은 "{product_name}"에 대한 블로그 리뷰입니다.
-
-[블로그 내용]
-{content[:1500]}
-
-위 내용에서 {product_name}의 장점과 단점을 추출해주세요.
-
-장점:
-- (구체적인 장점)
-
-단점:
-- (구체적인 단점)
-
-정보가 부족하면 "정보 부족"이라고 답하세요."""
+            pros_cons = crawler.extract_pros_cons_with_gpt(product_name, content)
+            
+            if pros_cons:
+                all_pros.extend(pros_cons['pros'])
+                all_cons.extend(pros_cons['cons'])
+                sources.append({
+                    'title': post['title'],
+                    'link': post['link']
+                })
                 
-                try:
-                    response = openai_client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": "노트북 리뷰 분석 전문가입니다."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        temperature=0.3,
-                        max_tokens=500
-                    )
-                    
-                    result = response.choices[0].message.content.strip()
-                    
-                    if result and "정보 부족" not in result:
-                        pros = []
-                        cons = []
-                        
-                        lines = result.split('\n')
-                        current_section = None
-                        
-                        for line in lines:
-                            line = line.strip()
-                            if '장점:' in line:
-                                current_section = 'pros'
-                            elif '단점:' in line:
-                                current_section = 'cons'
-                            elif line.startswith('-') and current_section:
-                                point = line[1:].strip()
-                                if point and len(point) > 5:
-                                    if current_section == 'pros':
-                                        pros.append(point)
-                                    else:
-                                        cons.append(point)
-                        
-                        if pros or cons:
-                            all_pros.extend(pros)
-                            all_cons.extend(cons)
-                            sources.append({
-                                'title': title,
-                                'link': post['link']
-                            })
-                            state["messages"].append(f"✓ 장점 {len(pros)}개, 단점 {len(cons)}개 추출")
-                except:
-                    pass
+                state["messages"].append(
+                    AIMessage(content=f"✓ 장점 {len(pros_cons['pros'])}개, 단점 {len(pros_cons['cons'])}개 추출 완료")
+                )
             
             time.sleep(0.5)
     
@@ -373,98 +450,89 @@ def crawl_web_node(state: SearchState) -> SearchState:
     state["cons"] = list(dict.fromkeys(all_cons))[:10]
     state["sources"] = sources[:5]
     
-    state["messages"].append(f"🎉 웹 크롤링 완료! 총 장점 {len(state['pros'])}개, 단점 {len(state['cons'])}개 수집")
-    state["web_search_complete"] = True
+    if state["pros"] or state["cons"]:
+        state["messages"].append(
+            AIMessage(content=f"🎉 웹 크롤링 완료! 총 장점 {len(state['pros'])}개, 단점 {len(state['cons'])}개 수집")
+        )
+        
+        # DB에 저장 (임베딩 포함)
+        try:
+            supabase = get_supabase_client()
+            embeddings_helper = get_embeddings_helper()
+            
+            # 제품명의 임베딩 생성
+            product_embedding = embeddings_helper.get_embedding(product_name)
+            
+            data = []
+            for pro in state["pros"]:
+                data.append({
+                    'product_name': product_name,
+                    'type': 'pro',
+                    'content': pro,
+                    'embedding': product_embedding  # 임베딩 추가
+                })
+            
+            for con in state["cons"]:
+                data.append({
+                    'product_name': product_name,
+                    'type': 'con',
+                    'content': con,
+                    'embedding': product_embedding  # 임베딩 추가
+                })
+            
+            if data:
+                supabase.table('laptop_pros_cons').insert(data).execute()
+                state["messages"].append(
+                    AIMessage(content="💾 데이터베이스에 저장 완료! (임베딩 포함)")
+                )
+        except Exception as e:
+            state["messages"].append(
+                AIMessage(content=f"⚠️ DB 저장 실패: {str(e)}")
+            )
+    else:
+        state["messages"].append(
+            AIMessage(content="😢 웹에서도 정보를 찾을 수 없습니다.")
+        )
     
     return state
 
-def process_results_node(state: SearchState) -> SearchState:
-    """결과 처리 노드"""
+def process_results(state: SearchState) -> SearchState:
+    """결과 처리 및 정리"""
     if state["search_method"] in ["database", "similarity"] and state["results"].get("data"):
         # DB 결과 처리
         data = state["results"]["data"]
         state["pros"] = [item['content'] for item in data if item['type'] == 'pro']
         state["cons"] = [item['content'] for item in data if item['type'] == 'con']
-        state["sources"] = []
+        state["sources"] = []  # DB에는 별도 소스 없음
         
-        state["messages"].append(f"📋 결과 정리: 장점 {len(state['pros'])}개, 단점 {len(state['cons'])}개")
+        state["messages"].append(
+            AIMessage(content=f"📋 결과 정리 완료: 장점 {len(state['pros'])}개, 단점 {len(state['cons'])}개")
+        )
     
     return state
-
-def save_to_database_node(state: SearchState) -> SearchState:
-    """데이터베이스 저장 노드"""
-    if state["search_method"] != "web_crawling" or not (state["pros"] or state["cons"]):
-        return state
-    
-    state["messages"].append(f"💾 데이터베이스에 저장 중...")
-    
-    supabase = get_supabase_client()
-    embeddings_helper = OpenAIEmbeddings()
-    
-    try:
-        # 임베딩 생성 (선택적)
-        embedding = None
-        # embedding = embeddings_helper.get_embedding(state["product_name"])
-        
-        data = []
-        for pro in state["pros"]:
-            data.append({
-                'product_name': state["product_name"],
-                'type': 'pro',
-                'content': pro,
-                # 'embedding': embedding
-            })
-        
-        for con in state["cons"]:
-            data.append({
-                'product_name': state["product_name"],
-                'type': 'con',
-                'content': con,
-                # 'embedding': embedding
-            })
-        
-        if data:
-            supabase.table('laptop_pros_cons').insert(data).execute()
-            state["messages"].append(f"✅ 데이터베이스 저장 완료!")
-            state["save_complete"] = True
-    except Exception as e:
-        state["messages"].append(f"⚠️ 저장 오류: {str(e)}")
-    
-    return state
-
-# ========================
-# LangGraph 워크플로우
-# ========================
 
 def should_search_web(state: SearchState) -> str:
-    """웹 검색 필요 여부 결정"""
+    """웹 검색이 필요한지 판단"""
     if state["results"].get("data"):
         return "process"
     else:
         return "crawl"
 
-def should_save_to_db(state: SearchState) -> str:
-    """DB 저장 필요 여부 결정"""
-    if state["search_method"] == "web_crawling" and (state["pros"] or state["cons"]):
-        return "save"
-    else:
-        return "end"
+# ========================
+# LangGraph 워크플로우 생성
+# ========================
 
 @st.cache_resource
 def create_search_workflow():
-    """검색 워크플로우 생성"""
     workflow = StateGraph(SearchState)
     
     # 노드 추가
-    workflow.add_node("search_db", search_database_node)
-    workflow.add_node("crawl_web", crawl_web_node)
-    workflow.add_node("process", process_results_node)
-    workflow.add_node("save_db", save_to_database_node)
+    workflow.add_node("search_db", search_database)
+    workflow.add_node("crawl_web", crawl_web)
+    workflow.add_node("process", process_results)
     
     # 엣지 설정
     workflow.set_entry_point("search_db")
-    
-    # DB 검색 후 분기
     workflow.add_conditional_edges(
         "search_db",
         should_search_web,
@@ -473,84 +541,73 @@ def create_search_workflow():
             "process": "process"
         }
     )
-    
-    # 웹 크롤링 후 처리
     workflow.add_edge("crawl_web", "process")
-    
-    # 결과 처리 후 분기
-    workflow.add_conditional_edges(
-        "process",
-        should_save_to_db,
-        {
-            "save": "save_db",
-            "end": END
-        }
-    )
-    
-    # DB 저장 후 종료
-    workflow.add_edge("save_db", END)
+    workflow.add_edge("process", END)
     
     return workflow.compile()
+
+# 워크플로우 인스턴스 생성
+search_app = create_search_workflow()
 
 # ========================
 # Streamlit UI
 # ========================
 
-# 워크플로우 초기화
-search_app = create_search_workflow()
-
-# 검색 UI
+# 검색 섹션
 col1, col2, col3 = st.columns([1, 3, 1])
 
 with col2:
     product_name = st.text_input(
         "🔍 제품명을 입력하세요",
-        placeholder="예: 맥북 프로 M3, LG 그램 2024, 갤럭시북4 프로"
+        placeholder="예: 맥북 프로 M3, LG 그램 2024, 갤럭시북4 프로, 게이트맨 도어락"
     )
     
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         search_button = st.button("🔍 검색하기", use_container_width=True, type="primary")
     with col_btn2:
-        show_process = st.checkbox("🔧 프로세스 보기", value=False)
+        show_process = st.checkbox("🔧 프로세스 보기", value=True)
 
 # 검색 실행
 if search_button and product_name:
-    # 초기 상태
-    initial_state = {
-        "product_name": product_name,
-        "search_method": "",
-        "results": {},
-        "pros": [],
-        "cons": [],
-        "sources": [],
-        "messages": [],
-        "error": "",
-        "db_search_complete": False,
-        "web_search_complete": False,
-        "save_complete": False
-    }
-    
-    # LangGraph 실행
     with st.spinner(f"'{product_name}' 검색 중..."):
+        # LangGraph 실행
+        initial_state = {
+            "product_name": product_name,
+            "search_method": "",
+            "results": {},
+            "pros": [],
+            "cons": [],
+            "sources": [],
+            "messages": [],
+            "error": "",
+            "similar_product": ""
+        }
+        
+        # 워크플로우 실행
         final_state = search_app.invoke(initial_state)
     
     # 프로세스 로그 표시
     if show_process and final_state["messages"]:
         with st.expander("🔧 검색 프로세스", expanded=True):
             for msg in final_state["messages"]:
-                st.write(msg)
+                if isinstance(msg, HumanMessage):
+                    st.write(f"👤 {msg.content}")
+                else:
+                    st.write(f"🤖 {msg.content}")
     
     # 결과 표시
     if final_state["pros"] or final_state["cons"]:
         # 검색 정보
+        method_display = {
+            "database": "데이터베이스 (정확히 일치)",
+            "similarity": f"AI 유사도 검색 ('{final_state.get('similar_product', '')}')",
+            "web_crawling": "웹 크롤링"
+        }
+        
         st.markdown(f"""
         <div class="process-info">
-            <strong>검색 방법:</strong> {
-                '데이터베이스 (정확히 일치)' if final_state["search_method"] == "database" else
-                'AI 유사도 검색' if final_state["search_method"] == "similarity" else
-                '웹 크롤링'
-            } | 
+            <strong>검색 방법:</strong> {method_display.get(final_state["search_method"], "알 수 없음")} | 
             <strong>장점:</strong> {len(final_state["pros"])}개 | 
             <strong>단점:</strong> {len(final_state["cons"])}개
         </div>
@@ -566,7 +623,7 @@ if search_button and product_name:
             </div>
             """, unsafe_allow_html=True)
             
-            for idx, pro in enumerate(final_state["pros"], 1):
+            for idx, pro in enumerate(final_state["pros"][:10], 1):
                 st.write(f"{idx}. {pro}")
         
         with col2:
@@ -576,7 +633,7 @@ if search_button and product_name:
             </div>
             """, unsafe_allow_html=True)
             
-            for idx, con in enumerate(final_state["cons"], 1):
+            for idx, con in enumerate(final_state["cons"][:10], 1):
                 st.write(f"{idx}. {con}")
         
         # 출처 (웹 크롤링인 경우)
@@ -587,7 +644,7 @@ if search_button and product_name:
         
         # 통계
         st.markdown("---")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("총 장점", f"{len(final_state['pros'])}개")
         with col2:
@@ -597,9 +654,6 @@ if search_button and product_name:
                      "DB" if final_state["search_method"] == "database" else 
                      "AI" if final_state["search_method"] == "similarity" else 
                      "웹")
-        with col4:
-            st.metric("프로세스 단계", 
-                     f"{len(final_state['messages'])}개")
     else:
         st.error(f"'{product_name}'에 대한 정보를 찾을 수 없습니다.")
 
@@ -611,7 +665,7 @@ with col1:
 with col2:
     st.info("🤖 OpenAI 임베딩을 사용한 지능형 검색")
 with col3:
-    st.info("📊 자동 데이터베이스 저장 및 관리")
+    st.info("💾 검색 결과 자동 저장 (임베딩 포함)")
 
 current_date = datetime.now().strftime('%Y년 %m월 %d일')
 st.markdown(f"""
